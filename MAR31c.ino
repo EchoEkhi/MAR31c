@@ -6,12 +6,23 @@
 #include <LCD5110_Graph.h>
 #include <Encoder.h>
 #include <EEPROM.h>
+#define passcode "0118999881999119725"
+#include <TimerOne.h>
 
 /*
    EEPROM datasheet
    0 - volume
    1 - showMP3UI
    2 - lcdbacklit
+   3 - alarm.hour()
+   4 - alarm.minute()
+   5 - alarm.second()
+   6 - alarmon
+   7 - lockdown
+   8 - alarmvolume //set to 0 to do automatic volume climb
+   9 - alarmfolder
+   10 - alarmsongnumber
+   11 - mp3EQ
 */
 
 SoftwareSerial mp3(4, 5); // RX, TX
@@ -23,21 +34,23 @@ DateTime now, alarm;
 
 extern unsigned char SmallFont[];
 extern uint8_t MediumNumbers[];
-char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 String rtcStatus, mp3Status, temp;
 bool rtcerror = false;
 bool mp3error = false;
 bool flag = false;
-bool alarmon = false;
+bool whitenoisemode = false;
+bool alarmon = EEPROM.read(6);
 bool mp3paused = false;
 bool showmp3UI = EEPROM.read(1);
 bool lcdbacklit = EEPROM.read(2);
-unsigned long int select, encoffset, secondinterrupt;
-String options[6];
-int pos;
+bool mp3loop = false;
+bool blinkstate = false;
+unsigned long int select, encoffset, secint;
+String options[10];
 
 void setup() {
   pinMode(13, OUTPUT);
+  pinMode(6, OUTPUT);
   Serial.begin(9600);
   myGLCD.InitLCD();
   myGLCD.clrScr();
@@ -50,13 +63,15 @@ void setup() {
     myGLCD.drawLine(83, 47 - i, 83 - (i * 1.75), 0);
     myGLCD.update();
   }
-  myGLCD.print(F("BOX OS"), CENTER, 15);
+  myGLCD.print(F("MAR31c"), CENTER, 15);
   myGLCD.print(F("BOOTING"), CENTER, 23);
-  myGLCD.print(F("mar31c 0822"), CENTER, 31);
-  myGLCD.print(F("BETA BUILD"), CENTER, 39);
+  myGLCD.print(F("mar31c 1.0"), CENTER, 31);
+  myGLCD.print(F("OMEGA RELEASE"), CENTER, 39);
   myGLCD.update();
+  Timer1.initialize(2000000);
+  Timer1.attachInterrupt(blinkpwr);
+  interrupts();
   mp3.begin(9600);
-  Serial.println(F("init"));
   if (! rtc.begin()) {
     rtcStatus = F("rtc init failed");
     rtcerror = true;
@@ -64,21 +79,20 @@ void setup() {
     rtcStatus = F("rtc lost power");
     rtcerror = true;
   }
-  Serial.println(F("complete"));
   if (!DFPlayer.begin(mp3)) {  //Use softwareSerial to communicate with mp3.
     mp3Status = F("mp3 init failed");
     mp3error = true;
   } else {
-    DFPlayer.reset();
-    delay(1000);
+    if (EEPROM.read(0) > 30) {
+      EEPROM.write(0, 10);
+    }
     DFPlayer.volume(EEPROM.read(0));
     DFPlayer.EQ(DFPLAYER_EQ_NORMAL);
     DFPlayer.setTimeOut(500);
-    DFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+    DFPlayer.outputDevice(EEPROM.read(11));
   }
   myGLCD.clrScr();
   myGLCD.update();
-  Serial.println(rtcerror);
   if (rtcerror) {
     while (clicked(false)) {
       for (int i = 84; i > -84; i--) {
@@ -109,51 +123,87 @@ void setup() {
     while (debounce());
   }
   digitalWrite(13, EEPROM.read(2));
+  alarm = DateTime(2000, 1, 1, EEPROM.read(3), EEPROM.read(4), EEPROM.read(5));
+  if (EEPROM.read(7)) {
+    myGLCD.clrScr();
+    myGLCD.print(F("The MAR31c is"), CENTER, 8);
+    myGLCD.print(F("under lockdown"), CENTER, 16);
+    myGLCD.print(F("enter passcode"), CENTER, 24);
+    myGLCD.print(F("to activate"), CENTER, 32);
+    myGLCD.update();
+    while (clicked(false));
+    while (debounce());
+    while (true) {
+      temp = F("");
+      encoffset = Enc.read();
+      while (true) {
+        myGLCD.clrScr();
+        myGLCD.print(F("ENTER PASSCODE"), CENTER, 0);
+        myGLCD.drawLine(0, 8, 84, 8);
+        ouflowpreventer(11, 0, 0, 9);
+        for (int i = 0; i < 10; i++) {
+          myGLCD.invertText(enc() == i);
+          myGLCD.print(String(char(i + 48)), (i + 1) * 6, 10);
+          myGLCD.invertText(enc() == 10);
+          myGLCD.print(F("Undo"), 6, 18);
+          myGLCD.invertText(false);
+          myGLCD.invertText(enc() == 11);
+          myGLCD.print(F("Confirm"), 36, 18);
+          myGLCD.invertText(false);
+        }
+        if (clicked(true)) {
+          while (debounce());
+          if (enc() < 10) {
+            temp = temp + String(char(enc() + 48));
+          } else if (enc() == 10) {
+            temp.remove(temp.length() - 1);
+          } else if (enc() == 11) {
+            break;
+          }
+        }
+        for (int i = 0; i < 14; i++) {
+          myGLCD.print(String(temp.charAt(i)), i * 6, 26);
+        }
+        for (int i = 0; i < 14; i++) {
+          myGLCD.print(String(temp.charAt(i + 14)), i * 6, 34);
+        }
+        myGLCD.update();
+      }
+      if (temp == passcode) {
+        EEPROM.write(7, false);
+        EEPROM.write(1, false);
+        delay(500);
+        break;
+      }
+    }
+  }
+  encoffset = Enc.read();
 }
 
 void loop() {
-  pos = Enc.read() - encoffset;
-  now = rtc.now();
   myGLCD.clrScr();
+  if (millis() - secint > 250) {
+    secint = millis();
+    now = rtc.now();
+  }
+
+  if (!mp3paused && analogRead(A2) > 500 && mp3loop) {
+    DFPlayer.start();
+  }
+
+  mp3paused = analogRead(A2) > 500;
   if (round(now.second() / 10) == 1 || round(now.second() / 10) == 3 || round(now.second() / 10) == 5 || !alarmon) {
     myGLCD.print(String(now.year()) + '/' + String(now.month()) + '/' + String(now.day()), CENTER, 0);
   } else {
-    if (alarm.hour() < 10) {
-      temp = '0' + String(alarm.hour());
-    } else {
-      temp = String(alarm.hour());
-    }
-
-    if (alarm.minute() < 10) {
-      temp = temp + ':' + '0' + String(alarm.minute());
-    } else {
-      temp = temp + ':' + String(alarm.minute());
-    }
-
-    if (alarm.second() < 10) {
-      temp = temp + ':' + '0' + String(alarm.second() < 10);
-    } else {
-      temp = temp + ':' + String(alarm.second() < 10);
-    }
+    temp = zeroadder(alarm.hour());
+    temp += ':' + zeroadder(alarm.minute());
+    temp += ':' + zeroadder(alarm.second());
     myGLCD.print(temp, CENTER, 0);
   }
   myGLCD.setFont(MediumNumbers);
-  if (now.hour() < 10) {
-    myGLCD.print('0' + String(now.hour()), 0, 8);
-  } else {
-    myGLCD.print(String(now.hour()), 0, 8);
-  }
-  if (now.minute() < 10) {
-    myGLCD.print('0' + String(now.minute()), CENTER, 8);
-  } else {
-    myGLCD.print(String(now.minute()), CENTER, 8);
-  }
-
-  if (now.second() < 10) {
-    myGLCD.print('0' + String(now.second()), 60, 8);
-  } else {
-    myGLCD.print(String(now.second()), 60, 8);
-  }
+  myGLCD.print(zeroadder(now.hour()), 0, 8);
+  myGLCD.print(zeroadder(now.minute()), CENTER, 8);
+  myGLCD.print(zeroadder(now.second()), 60, 8);
   myGLCD.setFont(SmallFont);
 
   if (showmp3UI) {
@@ -162,42 +212,38 @@ void loop() {
     menutree();
   }
 
-  if (alarm.year() == now.year()) {
-    if (alarm.month() == now.month()) {
-      if (alarm.day() == now.day()) {
-        if (alarm.hour() == now.hour()) {
-          if (alarm.minute() == now.minute()) {
-            if (alarm.second() == now.second()) {
-              if (alarmon) {
-                digitalWrite(13, HIGH);
-                while (clicked(false)) {
-                  myGLCD.clrScr();
-                  myGLCD.print(F("ALARM"), CENTER, 15);
-                  myGLCD.update();
-                  myGLCD.invert(true);
-                  delay(1000);
-                  myGLCD.invert(false);
-                  delay(1000);
-                }
-                myGLCD.invert(false);
-                digitalWrite(13, LOW);
-                while (debounce());
+  if (alarm.hour() == now.hour()) {
+    if (alarm.minute() == now.minute()) {
+      if (alarm.second() == now.second()) {
+        if (alarmon) {
+          int vol = 0;
+          unsigned long int timer = millis();
+          digitalWrite(13, HIGH);
+          DFPlayer.volume(EEPROM.read(8));
+          DFPlayer.loopFolder(EEPROM.read(9));
+          for (int i = 0; i < EEPROM.read(10); i++) {
+            DFPlayer.next();
+            delay(100);
+          }
+          timer = millis(); //do NOT merge this with the declaration
+          if (EEPROM.read(8) == 0) {
+            while (clicked(false)) {
+              if (vol != int((millis() - timer) / 1000)) {
+                DFPlayer.volume(int((millis() - timer) / 1000));
+                vol = int((millis() - timer) / 1000);
               }
             }
+          } else {
+            while (clicked(false));
           }
+          while (debounce());
+          DFPlayer.pause();
+          DFPlayer.volume(EEPROM.read(0));
+          digitalWrite(13, LOW);
         }
       }
     }
   }
-
-  if (0 == now.hour()) {
-    if (0 == now.minute()) {
-      if (0 == now.second()) {
-        alarm = DateTime(now.year(), now.month(), now.day(), alarm.hour(), alarm.minute(), alarm.second());
-      }
-    }
-  }
-
   myGLCD.update();
 }
 
@@ -217,21 +263,28 @@ bool clicked(bool inverter) {
 }
 
 void menu(int optnum, String title, String opts[]) {
-
+  int renderoffset = 0;
   encoffset = Enc.read() - 1;
   while (clicked(false)) {
     myGLCD.clrScr();
-    if (int(Enc.read() - encoffset) < 0) { //underflow preventer
-      encoffset = Enc.read();
-    }
-    if (int(Enc.read() - encoffset) > optnum) {
-      encoffset = Enc.read() - optnum;
+    ouflowpreventer(optnum, optnum, 0, 0);
+
+    if (enc() - renderoffset < 1) {
+      renderoffset--;
+    } else if (enc() - renderoffset > 4) {
+      renderoffset++;
     }
 
-    for (int i = 0; i < optnum; i++) { //print options
-      myGLCD.print(opts[i], 6, i * 8 + 11);
+    if (renderoffset < 0) {
+      renderoffset = 0;
+    } else if (renderoffset > optnum) {
+      renderoffset = optnum;
     }
-    if (Enc.read() - encoffset == 0) { //return
+
+    for (int i = 0; i + renderoffset < optnum; i++) { //print options
+      myGLCD.print(opts[i + renderoffset], 6, i * 8 + 11);
+    }
+    if (enc() == 0) { //return
       myGLCD.drawLine(0, 0, 84, 0);
       myGLCD.invertText(true);
       myGLCD.print(F("     HOME     "), CENTER, 1);
@@ -239,15 +292,14 @@ void menu(int optnum, String title, String opts[]) {
       myGLCD.invertText(false);
     } else { //norm
       myGLCD.print(title, CENTER, 1);
-      myGLCD.drawLine(0, 9, 84, 9);//UI
-      myGLCD.print(">", 0, (Enc.read() - encoffset) * 8 + 3);
+      myGLCD.drawLine(0, 9, 84, 9);
+      myGLCD.print(">", 0, int(enc() - renderoffset) * 8 + 3);
     }
     myGLCD.update();
   }
   while (debounce());
-  select = Enc.read() - encoffset;
+  select = enc();
   myGLCD.clrScr();
-
 }
 
 int selnum(String title, int mini, int maxi, int defaultint) {
@@ -284,7 +336,7 @@ int selnum(String title, int mini, int maxi, int defaultint) {
   while (debounce());
 
   if (int(Enc.read() - 1 - encoffset + mini) < mini) {
-    return defaultint;//default
+    return defaultint;//default because it underflowed to RETURN
   }
   if (int(Enc.read() - 1 - encoffset + mini) > maxi) {
     return maxi;//max overflow
@@ -310,23 +362,34 @@ void menutree() {
   options[2] = F("");
   menu(3, "Main Menu", options);
   if (select == 1) { //clock
-    options[0] = "Alarm";
-    options[1] = "Settings";
-    menu(2, "Clock", options);
+    options[0] = F("Alarm");
+    options[1] = F("Settings");
+    menu(2, F("Clock"), options);
     if (select == 1) { //alarm
-
       options[0] = F("Set alarm");
       if (alarmon) {
         options[1] = F("Turn off");
       } else {
         options[1] = F("Turn on");
       }
-      menu(2, F("Alarm"), options);
+      options[2] = F("Set volume");
+      options[3] = F("Set music");
+      menu(4, F("Alarm"), options);
       if (select == 1) { //set alarm
-        alarm = DateTime(selnum(F("Year"), 2000, 2100, alarm.year()), selnum(F("Month"), 1, 12, alarm.month()), selnum(F("Day"), 1, 31, alarm.day()), selnum(F("Hour"), 0, 23, alarm.hour()), selnum(F("Minute"), 0, 59, alarm.minute()), selnum(F("Second"), 0, 59, alarm.second()));
+        alarm = DateTime(2000, 1, 1, selnum(F("Hour"), 0, 23, alarm.hour()), selnum(F("Minute"), 0, 59, alarm.minute()), selnum(F("Second"), 0, 59, alarm.second()));
+        EEPROM.write(3, alarm.hour());
+        EEPROM.write(4, alarm.minute());
+        EEPROM.write(5, alarm.second());
         alarmon = true;
+        EEPROM.write(6, true);
       } else if (select == 2) { //toggle
         alarmon = !alarmon;
+        EEPROM.write(6, !EEPROM.read(6));
+      } else if (select == 3) {
+        EEPROM.write(8, selnum(F("Alarm volume"), 0, 30, EEPROM.read(8)));
+      } else if (select == 4) {
+        EEPROM.write(9, selnum(F("Alarm folder"), 1, 9, EEPROM.read(9)));
+        EEPROM.write(10, selnum(F("Alarm music"), 0, 100, EEPROM.read(10)));
       }
     } else if (select == 2) { //settings
       options[0] = F("Set RTC time");
@@ -338,7 +401,9 @@ void menutree() {
   } else if (select == 2) { //prefs
     options[0] = F("analogReadA1");
     options[1] = F("Backlight");
-    menu(2, F("Preferences"), options);
+    options[2] = F("Lockdown");
+    options[3] = F("Reset");
+    menu(4, F("Preferences"), options);
     if (select == 1) {
       while (true) {
         myGLCD.clrScr();
@@ -355,264 +420,243 @@ void menutree() {
         }
       }
     } else if (select == 2) {
-      if (lcdbacklit) {
-        digitalWrite(13, LOW);
-      } else {
-        digitalWrite(13, HIGH);
-      }
       lcdbacklit = !lcdbacklit;
+      digitalWrite(13, lcdbacklit);
       EEPROM.write(2, !EEPROM.read(2));
+    } else if (select == 3) {
+      EEPROM.write(7, true);
+      setup();
+    } else if (select == 4) {
+      setup();
     }
   } else if (select == 3) { //mp3 player
     options[0] = F("MP3 UI");
     options[1] = F("Playlist");
-    options[2] = F("Remove SD");
-    menu(3, "MP3 Player", options);
+    options[2] = F("Settings");
+    options[3] = F("Reset module");
+    menu(4, F("MP3 Player"), options);
     if (select == 1) {
       if (showmp3UI) {
         options[0] = F("Turn off");
       } else {
         options[0] = F("Turn on");
       }
-      menu(1, F("MP3 UI"), options);
+      options[1] = F("White noise");
+      menu(2, F("MP3 UI"), options);
       if (select == 1) {
         showmp3UI = !showmp3UI;
         EEPROM.write(1, !EEPROM.read(1));
+      } else if (select == 2) {
+        whitenoisemode = !whitenoisemode;
       }
     } else if (select == 2) {
-      options[0] = F("Music");
-      options[1] = F("Literature");
-      options[2] = F("Others");
-      menu(3, F("Playlist"), options);
-      if (select == 1) {
-        options[0] = F("English");
-        options[1] = F("Mandarin");
-        menu(2, F("Music"), options);
-        if (select == 1) {
-          DFPlayer.loopFolder(1);
-        } else if (select == 2) {
-          DFPlayer.loopFolder(2);
-        }
-      } else if (select == 2) {
-        options[0] = F("Series");
-        options[1] = F("Casual");
-        options[2] = F("Musicals");
-        options[3] = F("Explicit");
-        menu(4, F("Literature"), options);
-        if (select == 1) {
-          DFPlayer.loopFolder(3);
-        } else if (select == 2) {
-          DFPlayer.loopFolder(4);
-        } else if (select == 3) {
-          DFPlayer.loopFolder(5);
-        } else if (select == 4) {
-          DFPlayer.loopFolder(6);
-        }
+      options[0] = F("English");
+      options[1] = F("Mandarin");
+      options[2] = F("Series");
+      options[3] = F("White noise");
+      options[4] = F("Musicals");
+      options[5] = F("Casual");
+      options[6] = F("Alarm");
+      options[7] = F("Nostalgia");
+      options[8] = F("OpenTTD");
+      options[9] = F("Sleep");
+      menu(10, F("Playlist"), options);
+      if (select != 0) {
+        DFPlayer.loopFolder(select);
+        DFPlayer.disableLoopAll();
+        DFPlayer.start();
       }
-
     } else if (select == 3) {
-      myGLCD.clrScr();
-      myGLCD.print(F("Message"), CENTER, 0);
-      myGLCD.drawLine(0, 8, 84, 8);
-      myGLCD.print(F("You can now"), CENTER, 9);
-      myGLCD.print(F("safely remove"), CENTER, 17);
-      myGLCD.print(F("the SD Card"), CENTER, 25);
-      myGLCD.print(F("Click when done"), CENTER, 41);
-      myGLCD.update();
-      while (clicked(false));
-      while (debounce());
-      mp3error = true;
-    } else {
-      //home
+      options[0] = F("Normal");
+      options[1] = F("Pop");
+      options[2] = F("Rock");
+      options[3] = F("Jazz");
+      options[4] = F("Classic");
+      options[5] = F("Bass");
+      menu(6, F("EQ Settings"), options);
+      if (select != 0) {
+        DFPlayer.EQ(select);
+      }
+    } else if (select == 4) {
+      DFPlayer.reset();
+      DFPlayer.volume(EEPROM.read(0));
+      DFPlayer.EQ(EEPROM.read(11));
+      DFPlayer.setTimeOut(500);
+      DFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     }
   }
 }
+
 
 void mp3UI() {
-  myGLCD.invPixel(9, 27);//menu icon
-  myGLCD.drawLine(11, 27, 16, 27);
-  myGLCD.invPixel(9, 29);
-  myGLCD.drawLine(11, 29, 16, 29);
-  myGLCD.invPixel(9, 31);
-  myGLCD.drawLine(11, 31, 16, 31);
-  myGLCD.invPixel(9, 33);
-  myGLCD.drawLine(11, 33, 16, 33);
-
-  myGLCD.invPixel(21, 27);
-  myGLCD.invPixel(22, 27);
-  myGLCD.invPixel(23, 27);
-  myGLCD.invPixel(20, 28);
-  myGLCD.invPixel(24, 28);
-  myGLCD.invPixel(20, 29);
-  myGLCD.invPixel(24, 29);
-  myGLCD.invPixel(20, 30);
-  myGLCD.invPixel(22, 30);
-  myGLCD.invPixel(24, 30);
-  myGLCD.invPixel(20, 31);
-  myGLCD.invPixel(22, 31);
-  myGLCD.invPixel(24, 31);
-  myGLCD.invPixel(21, 32);
-  myGLCD.invPixel(22, 32);
-  myGLCD.invPixel(23, 32);
-  myGLCD.invPixel(21, 33);
-  myGLCD.invPixel(22, 33);
-  myGLCD.invPixel(23, 33);
-
-  myGLCD.invPixel(29, 28);//prev button
-  myGLCD.invPixel(32, 28);
-  myGLCD.invPixel(35, 28);
-  myGLCD.invPixel(29, 29);
-  myGLCD.invPixel(31, 29);
-  myGLCD.invPixel(32, 29);
-  myGLCD.invPixel(34, 29);
-  myGLCD.invPixel(35, 29);
-  myGLCD.invPixel(29, 30);
-  myGLCD.invPixel(30, 30);
-  myGLCD.invPixel(31, 30);
-  myGLCD.invPixel(32, 30);
-  myGLCD.invPixel(33, 30);
-  myGLCD.invPixel(34, 30);
-  myGLCD.invPixel(35, 30);
-  myGLCD.invPixel(29, 31);
-  myGLCD.invPixel(31, 31);
-  myGLCD.invPixel(32, 31);
-  myGLCD.invPixel(34, 31);
-  myGLCD.invPixel(35, 31);
-  myGLCD.invPixel(29, 32);
-  myGLCD.invPixel(32, 32);
-  myGLCD.invPixel(35, 32);
-
-  if (mp3paused) {
-    myGLCD.invPixel(39, 27);//play button
-    myGLCD.invPixel(39, 28);
-    myGLCD.invPixel(40, 28);
-    myGLCD.invPixel(41, 28);
-    myGLCD.invPixel(39, 29);
-    myGLCD.invPixel(40, 29);
-    myGLCD.invPixel(41, 29);
-    myGLCD.invPixel(42, 29);
-    myGLCD.invPixel(43, 29);
-    myGLCD.invPixel(39, 30);
-    myGLCD.invPixel(40, 30);
-    myGLCD.invPixel(41, 30);
-    myGLCD.invPixel(42, 30);
-    myGLCD.invPixel(43, 30);
-    myGLCD.invPixel(44, 30);
-    myGLCD.invPixel(45, 30);
-    myGLCD.invPixel(39, 31);
-    myGLCD.invPixel(40, 31);
-    myGLCD.invPixel(41, 31);
-    myGLCD.invPixel(42, 31);
-    myGLCD.invPixel(43, 31);
-    myGLCD.invPixel(39, 32);
-    myGLCD.invPixel(40, 32);
-    myGLCD.invPixel(41, 32);
-    myGLCD.invPixel(39, 33);
-
-  } else {
-    myGLCD.drawLine(40, 27, 40, 34);//pause icon
-    myGLCD.drawLine(44, 27, 44, 34);
+  for (int i = 27; i < 34; i += 2) {//menu icon
+    myGLCD.invPixel(9, i);
+    myGLCD.drawLine(11, i, 16, i);
   }
 
-  myGLCD.invPixel(49, 28);//next icon
-  myGLCD.invPixel(52, 28);
-  myGLCD.invPixel(55, 28);
-  myGLCD.invPixel(49, 29);
-  myGLCD.invPixel(50, 29);
-  myGLCD.invPixel(52, 29);
-  myGLCD.invPixel(53, 29);
-  myGLCD.invPixel(55, 29);
-  myGLCD.invPixel(49, 30);
-  myGLCD.invPixel(50, 30);
-  myGLCD.invPixel(51, 30);
-  myGLCD.invPixel(52, 30);
-  myGLCD.invPixel(53, 30);
-  myGLCD.invPixel(54, 30);
-  myGLCD.invPixel(55, 30);
-  myGLCD.invPixel(49, 31);
-  myGLCD.invPixel(50, 31);
-  myGLCD.invPixel(52, 31);
-  myGLCD.invPixel(53, 31);
-  myGLCD.invPixel(55, 31);
-  myGLCD.invPixel(49, 32);
-  myGLCD.invPixel(52, 32);
-  myGLCD.invPixel(55, 32);
+  myGLCD.drawLine(21, 27, 24, 27); //backlight button
+  myGLCD.drawLine(20, 28, 20, 32);
+  myGLCD.drawLine(24, 28, 24, 32);
+  myGLCD.drawLine(22, 30, 22, 32);
+  myGLCD.drawRect(21, 32, 23, 33);
 
-  myGLCD.invPixel(59, 30);//volume down icon
-  myGLCD.invPixel(60, 30);
-  myGLCD.invPixel(61, 30);
+  if (whitenoisemode) {
+    myGLCD.print(F("ON"), CENTER, 27);
+  } else {
+    for (int i = 29; i < 36; i += 3) {//prev button
+      myGLCD.drawLine(i, 28, i, 33);
+    }
+    for (int i = 31; i < 35; i += 3) {
+      myGLCD.invPixel(i - 1, 30);
+      myGLCD.drawLine(i, 29, i, 32);
+    }
+
+    if (analogRead(A2) > 500) {
+      for (int i = 1; i < 8; i++) {//play button
+        myGLCD.drawLine(i + 38, round(i / 2) + 27, i + 38, 34 - round(i / 2));
+      }
+    } else {
+      myGLCD.drawLine(40, 27, 40, 34);//pause button
+      myGLCD.drawLine(44, 27, 44, 34);
+    }
+
+    for (int i = 49; i < 56; i += 3) {//next button
+      myGLCD.drawLine(i, 28, i, 33);
+    }
+    for (int i = 50; i < 54; i += 3) {
+      myGLCD.invPixel(i + 1, 30);
+      myGLCD.drawLine(i, 29, i, 32);
+    }
+  }
+
+  myGLCD.invPixel(61, 27);//loop icon
+  myGLCD.invPixel(62, 27);
+  myGLCD.invPixel(63, 27);
+  myGLCD.invPixel(60, 28);
+  myGLCD.invPixel(64, 28);
+  myGLCD.invPixel(59, 29);
+  myGLCD.invPixel(62, 29);
+  myGLCD.invPixel(65, 29);
+  myGLCD.invPixel(59, 30);
   myGLCD.invPixel(62, 30);
-  myGLCD.invPixel(63, 30);
-  myGLCD.invPixel(64, 30);
   myGLCD.invPixel(65, 30);
+  myGLCD.invPixel(59, 31);
+  myGLCD.invPixel(62, 31);
+  myGLCD.invPixel(65, 31);
+  myGLCD.invPixel(60, 32);
+  myGLCD.invPixel(61, 33);
+  myGLCD.invPixel(62, 33);
+  myGLCD.invPixel(63, 33);
+  myGLCD.invPixel(64, 33);
+  myGLCD.invPixel(65, 33);
 
-  myGLCD.invPixel(72, 27);//volume up icon
-  myGLCD.invPixel(72, 28);
+  myGLCD.invPixel(72, 27);//volume icon
+  myGLCD.invPixel(71, 28);
+  myGLCD.invPixel(74, 28);
+  myGLCD.invPixel(69, 29);
+  myGLCD.invPixel(70, 29);
   myGLCD.invPixel(72, 29);
+  myGLCD.invPixel(75, 29);
   myGLCD.invPixel(69, 30);
   myGLCD.invPixel(70, 30);
-  myGLCD.invPixel(71, 30);
   myGLCD.invPixel(72, 30);
-  myGLCD.invPixel(73, 30);
-  myGLCD.invPixel(74, 30);
   myGLCD.invPixel(75, 30);
+  myGLCD.invPixel(69, 31);
+  myGLCD.invPixel(70, 31);
   myGLCD.invPixel(72, 31);
-  myGLCD.invPixel(72, 32);
+  myGLCD.invPixel(75, 31);
+  myGLCD.invPixel(71, 32);
+  myGLCD.invPixel(74, 32);
   myGLCD.invPixel(72, 33);
 
-
-  //myGLCD.drawRect(0, 25, 83, 47);
-
-  if (pos * 10 + 7 < 0) { //underflow preventer
-    encoffset = Enc.read();
-  } else if (pos * 10 + 7 > 67) { //overflow preventer
-    encoffset = Enc.read() - 6;
-  }
-
-  myGLCD.drawRoundRect(pos * 10 + 7, 25, pos * 10 + 17, 35);//selection box
-
-  if (analogRead(A2) < 500) {
-    mp3paused = false;
+  ouflowpreventer(6, 6, 0, 0);
+  if (whitenoisemode) {
+    if (enc() > 1 && enc() < 5) {
+      myGLCD.drawRoundRect(27, 25, 57, 35);
+    } else {
+      myGLCD.drawRoundRect(int(enc()) * 10 + 7, 25, int(enc()) * 10 + 17, 35);//selection box
+    }
   } else {
-    mp3paused = true;
+    myGLCD.drawRoundRect(int(enc()) * 10 + 7, 25, int(enc()) * 10 + 17, 35);//selection box
   }
-
-
 
   if (clicked(true)) {
-    while (debounce());
-    if (pos == 0) {
+    bool hold = true;
+    select = millis();
+    if (enc() == 0) {
       menutree();
-    } else if (pos == 1) {
-      if (lcdbacklit) {
-        digitalWrite(13, LOW);
-      } else {
-        digitalWrite(13, HIGH);
-      }
+      hold = false;
+    } else if (enc() == 1) {
       lcdbacklit = !lcdbacklit;
+      digitalWrite(13, lcdbacklit);
       EEPROM.write(2, !EEPROM.read(2));
-    } else if (pos == 2) {
+    } else if (enc() == 2) {
+      mp3loop = false;
       DFPlayer.previous();
-    } else if (pos == 3) {
-      if (mp3paused) {
-        mp3paused = false;
+    } else if (enc() == 3) {
+      mp3loop = false;
+      if (analogRead(A2) > 500) {
         DFPlayer.start();
       } else {
-        mp3paused = true;
         DFPlayer.pause();
       }
-    } else if (pos == 4) {
+    } else if (enc() == 4) {
+      mp3loop = false;
       DFPlayer.next();
-    } else if (pos == 5) {
-      DFPlayer.volumeDown();
-      EEPROM.write(0, EEPROM.read(0) - 1);
-    } else if (pos == 6) {
-      DFPlayer.volumeUp();
-      EEPROM.write(0, EEPROM.read(0) + 1);
+    } else if (enc() == 5) {
+      mp3loop = !mp3loop;
+    } else if (enc() == 6) {
+      hold = false;
+      myGLCD.setFont(MediumNumbers);
+      encoffset = Enc.read() - EEPROM.read(0);
+      while (debounce());
+      while (true) {
+        myGLCD.clrScr();
+        ouflowpreventer(30, 30, 0, 0);
+        myGLCD.print(String(enc()), CENTER, 10);
+        myGLCD.drawRect(12, 35, 74, 44);
+        for (int i = 0; i < enc() * 2; i += 2) {
+          myGLCD.drawRect(i + 13, 36, i + 14, 44);
+        }
+        DFPlayer.volume(enc());
+        myGLCD.update();
+        if (clicked(true)) {
+          EEPROM.write(0, enc());
+          break;
+        }
+      }
     }
     while (debounce());
+    if (millis() - select > 2000 && hold) {
+      whitenoisemode = !whitenoisemode;
+      DFPlayer.loopFolder(4);
+    }
   }
 }
 
+long int enc() {
+  return int(Enc.read() - encoffset);
+}
 
+void ouflowpreventer(int maxi, int maxidef, int mini, int minidef) {
+  if (int(enc()) > maxi) {
+    encoffset = Enc.read() - maxidef;
+  }
+  if (int(enc()) < mini) {
+    encoffset = Enc.read() - minidef;
+  }
+}
 
+String zeroadder(int str) {
+  if (str < 10) {
+    return '0' + String(str);
+  } else {
+    return String(str);
+  }
+}
+
+void blinkpwr() {
+  blinkstate = !blinkstate;
+  digitalWrite(6, blinkstate);
+  Serial.println("interr");
+}
